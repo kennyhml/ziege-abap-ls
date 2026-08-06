@@ -1,15 +1,25 @@
 # ABAP Language Server
+A language server for the ABAP programming language, largely based on [ziege](https://github.com/kennyhml/ziege) tooling
 
-A read-only ABAP language server and repository filesystem for Ziege. The server
-uses `zadt` for ADT, `zvfs` for lazy repository traversal, `zaff` for source-file
-projection, and `tower-lsp-server` for LSP transport.
+> "But language servers for ABAP already exist, including a SAP language server!"
 
-The daemon listens on `127.0.0.1:9257`. It retains repository trees across
-client reconnects and exits ten minutes after the last client disconnects.
+Correct, currently the idea is not for this language server to compete with the adt-ls, but to embrace it. In the literal sense, in the form of a wrapper.
+This approach gives us the best of both worlds: a fully open source language server, tooling to enhance it with, and the more battle tested official
+language tooling to fall back on for functionality that is difficult to support.
+
+Nevertheless, in the long run, the goal is to bring more language server capability into the project natively, for several reasons:
+1. Official tooling is closed source and, at least in my opinion, shows signs of entropy. Headless Eclipse is not a viable long-term.
+2. Current implementations just proxy the ADT backend to an editor. LS capabilities should run much more locally where possible.
+3. ADT-LS can not be fully implemented with the current scope of the language server protocol. This makes it a pain to integrate with certain editors, such as Neovim, or Zed, due to its closed source nature.
+
+> [!WARNING]
+> All of the below is unstable and experimental.
+
+The language server currently runs as a daemon and listens on `127.0.0.1:9257`, it only shuts down after
+a set timeout of connection inactivity.
 
 ## Configuration
-
-Project configuration lives in `.ziege` and is parsed by the server:
+Project configuration lives locally in a `.ziege` and is parsed by the server:
 
 ```yaml
 version: 1
@@ -26,10 +36,7 @@ systems:
         label: System Library
 ```
 
-User destinations live in `~/.ziegerc`. Set `ZIEGE_CONFIG` to override the
-path. Passwords must come from an environment variable; other fields may use a
-literal value or a corresponding `_env` field.
-
+User destinations live in `~/.ziegerc`. 
 ```toml
 version = 1
 
