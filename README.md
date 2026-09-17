@@ -1,42 +1,69 @@
-# ABAP Language Server
-A language server for the ABAP programming language, largely based on [ziege](https://github.com/kennyhml/ziege) tooling
+# ziege-abap-ls
 
-> "But language servers for ABAP already exist, including a SAP language server!"
+A language server implementation for the ABAP programming language based on
+the ziege tooling library.
 
-Correct, currently the idea is not for this language server to compete with the adt-ls, but to embrace it. In the literal sense, in the form of a wrapper.
-This approach gives us the best of both worlds: a fully open source language server, tooling to enhance it with, and the more battle tested official
-language tooling to fall back on for functionality that is difficult to support.
+## Background
 
-Nevertheless, in the long run, the goal is to bring more language server capability into the project natively, for several reasons:
-1. Official tooling is closed source and, at least in my opinion, shows signs of entropy. Headless Eclipse is not a viable long-term.
-2. Current implementations just proxy the ADT backend to an editor. LS capabilities should run much more locally where possible.
-3. ADT-LS can not be fully implemented with the current scope of the language server protocol. This makes it a pain to integrate with certain editors, such as Neovim, or Zed, due to its closed source nature.
+Several ABAP language servers already exist, including SAP's official server.
+This project is a way to explore a different design, without depending on Eclipse
+or closed source tooling. I started it before the official language server was announced,
+paused it while I was still using VSCode in favor of the official extension, then decided 
+to pick it back up after switching to Neovim.
 
-> [!WARNING]
-> All of the below is unstable and experimental.
+ABAP development needs repository browsing, remote files, locks and activation. 
+Much of this falls outside the LSP specification, so supporting editors like Neovim 
+and Zed takes more than standard language features.
 
-The language server currently runs as a daemon and listens on `127.0.0.1:9257`, it only shuts down after
-a set timeout of connection inactivity.
+There is also room to do more locally. Caching, parsing and indexing could reduce
+requests to ADT and support analysis beyond the available ADT calls.
+
+## Running & Connecting
+
+Run the server with
+```sh
+ziege-abap-ls           
+```
+Use `--help` for more usage information.
+
+The server listens on `ZIEGE_LSP_ADDRESS` (`127.0.0.1:9257` by default). It supports multi-client
+connection based on client connection behavior. That means a client may connect to an existing
+lanuage server or spawn a dedicated process. The server will not shut down while any clients
+are connected to it. This allows different clients to benefit from shared caching layers.
+
+You can also pass a `--daemon` flag to the launch arguments. The server will then stay alive without
+any active connections for up to `ZIEGE_IDLE_TIMEOUT_SECONDS` seconds. The default is 10 minutes.
 
 ## Configuration
-Project configuration lives locally in a `.ziege` and is parsed by the server:
 
-```yaml
-version: 1
-systems:
-  S4:
-    folder: SAP-DEV
-    destination: DEV
-    mounts:
-      - kind: package
-        label: Flight
-        package: /DMO/FLIGHT
-        facets: [GROUP, TYPE]
-      - kind: systemLibrary
-        label: System Library
+Configuration files use TOML and currently require `version = 1`. There are multiple levels of configuration.
+
+### Project-local
+
+A local `ziege.toml` selects destinations to use in the current project and their repository mounts. 
+
+```toml
+version = 1
+
+[systems.DEV]
+folder = "SAP-DEV"
+
+[[systems.DEV.mounts]]
+kind = "package"
+label = "Flight"
+package = "/DMO/FLIGHT"
 ```
 
-User destinations live in `~/.ziegerc`. 
+### User
+
+`~/.config/ziege/config.toml` holds user preferences. An absolute `XDG_CONFIG_HOME` replaces `~/.config`, 
+and `ZIEGE_CONFIG` overrides the full file path. This is currently not used.
+
+### Destinations
+
+`destinations.toml` lives beside the user configuration and defines connections
+shared across projects. Values are literal, including credentials.
+
 ```toml
 version = 1
 
@@ -44,63 +71,52 @@ version = 1
 url = "https://example.invalid"
 client = "100"
 language = "EN"
-username_env = "DEV_USERNAME"
-password_env = "DEV_PASSWORD"
+username = "DEVELOPER"
+password = "example-password"
 ```
 
-Mounts are ordered. Omitting `mounts` creates one `System Library` mount.
-Package mounts accept `package`, an optional `label`, and an optional `facets`
-list. A facet can be a string or an adaptive level:
-
-```yaml
-facets:
-  - GROUP
-  - facet: TYPE
-    minimumObjects: 10
-```
-
-Selection mounts accept `filters` with `facet`, `values`, and optional
-`exclude` values.
+`language` defaults to `EN`. The other connection fields are required.
 
 ## Protocol
 
-The custom protocol is advertised as `capabilities.experimental.ziege` version
-1 and consists of:
+Protocol version **1** must currently be used exclusively.
 
-- `ziege/project/systems`
-- `ziege/fileSystem/readDirectory`
-- `ziege/fileSystem/readFile`
-- `ziege/objectCreation/options`
-- `ziege/objectCreation/refreshTransports`
+The `initialize` request supplies one `workspaceFolders` entry with a local file
+URI such as `file:///home/user/dev/my%20project`. Older clients may use `rootUri`
+instead. The server decodes and canonicalizes this once into a
+[`ProjectRoot`](src/config/project.rs). Each worker stays bound to that root for
+its connection. Multiple projects use separate connections to the same daemon.
 
-The two object-creation discovery methods currently return `supported: false`.
-No create method is registered or advertised until typed ADT object-lifecycle
-and CTS transport APIs are available.
+`ziege/project/systems` can be called to get the system portals to display in the editor.
 
-Opening a project only reads `.ziege`. The first directory request for a system
-resolves `~/.ziegerc`, authenticates, performs ADT discovery, and constructs its
-lazy `zvfs` tree. Supported `PROG/P`, `PROG/I`, and `CLAS/OC` object leaves are
-projected as read-only AFF main-source files.
+```json
+{ "systems": [{ "folder": "SAP-DEV", "uri": "abap://DEV/vfs/" }] }
+```
 
-Clients can choose how AFF namespace delimiters are displayed per connection:
+Opening a portal follows the returned root URI. The client does not need a separate
+system alias or destination field.
+
+`ziege/fileSystem/readDirectory` takes a URI and an optional refresh flag:
 
 ```json
 {
-  "initializationOptions": {
-    "presentation": {
-      "namespaceDelimiter": "slash"
-    }
-  }
+  "uri": "abap://DEV/vfs/Flight/Classes/",
+  "refresh": false
 }
 ```
 
-Accepted values are `parentheses` (the default) and `slash`. This changes only
-the outward filename; source resolution and shared repository contexts continue
-to use canonical AFF names.
+The response contains `entries` with `uri`, `name`, and `kind` (`folder`,
+`package`, or `object`). Open the returned `uri` when entering a directory.
 
-## Development
+### Resource URIs
 
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+```text
+abap://DEV/vfs/Flight/Classes/
+abap://DEV/zcl_example.clas.abap
+abap://DEV/zcl_example.clas.json
 ```
+
+The authority is the actual destination ID. A `/vfs/` path addresses the project view.
+A single file name under the destination addresses a projected document without
+depending on the mounts used to find it. 
+

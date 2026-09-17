@@ -1,145 +1,202 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-
-use tokio::{
-    sync::{Mutex, RwLock},
-    time::timeout,
+//! Shared backend connections, cache layers and repository view state.
+//!
+//! If the language server only had one client per server, bound to each others
+//! lifetimes, system context could simply be stored on each `Server` worker.
+//!
+//! But because our server can outlive a client session that subsequently reconnects
+//! and handle any number of clients connected to the same process, we can use a
+//! common context layer for all clients. That way two instances of, for example,
+//! Neovim, can both connect to system `A4H` from different roots and benefit from
+//! a shared object cache layer and a shared ADT [`Client`].
+use std::{
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::Arc,
 };
-use zadt::{Client, Ready, ReqwestTransport};
-use zvfs::VirtualRepositoryTree;
 
-use crate::config::{ConfigError, LoadedSystem, load_system};
+use tokio::sync::Mutex;
+use zadt::{Client, Discovery, ReqwestTransport};
+use zvfs::{Mount, VirtualRepositoryTree};
 
-const CONTEXT_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_CONFIGURATION_RETRIES: usize = 3;
+use crate::config::{ConfigError, DestinationConfig, DestinationId, MountConfig, ProjectRoot};
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct ContextKey {
-    project_root: PathBuf,
-    system_id: String,
-    fingerprint: u64,
-}
+/// Shared slots indexed by some identity. A mutex per entry allows for
+/// quick insertion without keeping the map locked. The initialization
+/// can then take place without locking the full context.
+pub type ContextMap<K, V> = Mutex<HashMap<K, Arc<Mutex<Option<V>>>>>;
 
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct ContextIdentity {
-    project_root: PathBuf,
-    system_id: String,
-}
-
-impl ContextKey {
-    fn from_loaded(loaded: &LoadedSystem) -> Self {
-        Self {
-            project_root: loaded.project_root.clone(),
-            system_id: loaded.system_id.clone(),
-            fingerprint: loaded.fingerprint(),
-        }
-    }
-
-    fn identity(&self) -> ContextIdentity {
-        ContextIdentity {
-            project_root: self.project_root.clone(),
-            system_id: self.system_id.clone(),
-        }
-    }
-}
-
+/// Shared state for one configured backend.
+///
+/// Because the server runs as a daemon, multiple clients may connect to the
+/// same backend system and use this common context layer. They use the same
+/// ADT [`Client`] to communicate with the backend.
+///
+/// A fingerprint is used to ensure that changing connection configuration causes
+/// the context to become incompatible.
 pub struct SystemContext {
-    pub client: Client<Ready>,
-    pub tree: VirtualRepositoryTree,
+    /// Shared discovered client for communicating with the backend.
+    pub client: Client<Discovery>,
+    /// Fingerprint of the configuration at the time of insertion
+    fingerprint: u64,
+    /// Projects of the same root (same mount configuration) can share the
+    /// repository tree. Otherwise they can exist in parallel for one connection
+    views: ContextMap<ProjectRoot, Arc<SystemView>>,
 }
 
-#[derive(Default)]
-pub struct ContextStore {
-    contexts: RwLock<HashMap<ContextKey, Arc<SystemContext>>>,
-    creation_gates: Mutex<HashMap<ContextIdentity, Arc<Mutex<()>>>>,
-}
+impl SystemContext {
+    /// Gets the [`SystemView`] for a specific [`ProjectRoot`], if one exists.
+    pub async fn view(&self, project: &ProjectRoot) -> Option<Arc<SystemView>> {
+        let slot = self.views.lock().await.get(project)?.clone();
+        slot.lock().await.clone()
+    }
 
-impl ContextStore {
-    pub async fn get_or_create(
+    /// Inserts or updates a [`SystemView`] at the provided [`ProjectRoot`] with
+    /// a specified set of [`MountConfig`]. If a view with the exact same root
+    /// project and mount configuration already exists, it is simply returned.
+    ///
+    /// If neither the project root nor the mounts have actually changed, the
+    /// instance is left untouched. This is useful when a refresh was issued
+    /// and its uncertain whether the mount configuration is still recent.
+    pub async fn upsert_view(
         &self,
-        project_uri: &str,
-        system_id: &str,
-    ) -> Result<Arc<SystemContext>, ContextError> {
-        'identity: loop {
-            let loaded = load_system(project_uri, system_id).await?;
-            let key = ContextKey::from_loaded(&loaded);
-            if let Some(context) = self.contexts.read().await.get(&key).cloned() {
-                return Ok(context);
-            }
+        project: &ProjectRoot,
+        mounts: &[MountConfig],
+    ) -> Result<Arc<SystemView>, ContextError> {
+        let slot = self
+            .views
+            .lock()
+            .await
+            .entry(project.clone())
+            .or_default()
+            .clone();
 
-            let identity = key.identity();
-            let gate = {
-                let mut gates = self.creation_gates.lock().await;
-                gates
-                    .entry(identity.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
-            let guard = gate.lock().await;
-            let mut loaded = load_system(project_uri, system_id).await?;
-            if ContextKey::from_loaded(&loaded).identity() != identity {
-                drop(guard);
-                continue 'identity;
-            }
-
-            for _ in 0..MAX_CONFIGURATION_RETRIES {
-                let key = ContextKey::from_loaded(&loaded);
-                if let Some(context) = self.contexts.read().await.get(&key).cloned() {
-                    return Ok(context);
-                }
-
-                let context = timeout(CONTEXT_BUILD_TIMEOUT, build_context(&loaded))
-                    .await
-                    .map_err(|_| ContextError::BuildTimeout)??;
-                let current = load_system(project_uri, system_id).await?;
-                let current_key = ContextKey::from_loaded(&current);
-                if current_key.identity() != identity {
-                    drop(guard);
-                    continue 'identity;
-                } else if current_key != key {
-                    loaded = current;
-                    continue;
-                }
-
-                let context = Arc::new(context);
-                let mut contexts = self.contexts.write().await;
-                contexts.retain(|existing, _| {
-                    existing.project_root != key.project_root || existing.system_id != key.system_id
-                });
-                contexts.insert(key, context.clone());
-                return Ok(context);
-            }
-            return Err(ContextError::ConfigurationChanged);
+        let mut current = slot.lock().await;
+        // Only if the mount configuration has not changed is this still
+        // compatible. This is overly sensitive regarding labels, but thats ok.
+        if let Some(view) = current.as_ref()
+            && view.mounts == mounts
+        {
+            return Ok(view.clone());
         }
+
+        // Resolve the mounts from our config format into the zvfs format
+        // TODO: Maybe a wrapper struct around a vec of mounts?
+        let built_mounts = if mounts.is_empty() {
+            vec![Mount::system_library("System Library")]
+        } else {
+            mounts
+                .iter()
+                .map(MountConfig::build)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let tree = VirtualRepositoryTree::builder(self.client.clone())
+            .mounts(built_mounts)
+            .build()
+            .await?;
+
+        let view = Arc::new(SystemView {
+            mounts: mounts.to_vec(),
+            tree,
+        });
+        *current = Some(view.clone());
+        Ok(view)
     }
 }
 
-async fn build_context(loaded: &LoadedSystem) -> Result<SystemContext, ContextError> {
-    let transport = ReqwestTransport::builder()
-        .destination(&loaded.destination.url)
-        .sap_client(&loaded.destination.client)
-        .language(&loaded.destination.language)
-        .basic_auth(&loaded.destination.username, &loaded.destination.password)
-        .build()?;
-    let client = Client::new(transport).discover().await?;
-    let tree = VirtualRepositoryTree::builder(client.clone())
-        .mounts(loaded.mounts()?)
-        .build()
-        .await?;
-    Ok(SystemContext { client, tree })
+/// Process-wide backend contexts indexed only by the configured [`DestinationId`].
+///
+/// Configuration revisions replace the selected context rather than adding keys
+/// or retaining a history of backend connections.
+#[derive(Default)]
+pub struct SystemContextStore {
+    contexts: ContextMap<DestinationId, Arc<SystemContext>>,
+}
+
+impl SystemContextStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retrieves a [`SystemContext`] for the given [`DestinationId`] if existent
+    pub async fn get(&self, id: &DestinationId) -> Option<Arc<SystemContext>> {
+        let slot = self.contexts.lock().await.get(id)?.clone();
+        slot.lock().await.clone()
+    }
+
+    /// Inserts or updates a [`SystemContext`] based on whether the provided
+    /// [`DestinationConfig`] still has the same fingerprint as the stored system.
+    ///
+    /// If a system with the same configuration already exists, it is simply returned
+    /// without being touched. This is convenient when a refresh leaves us uncertain
+    /// whether the configuration is still recent.
+    pub async fn upsert(
+        &self,
+        id: &DestinationId,
+        config: &DestinationConfig,
+    ) -> Result<Arc<SystemContext>, ContextError> {
+        let mut hasher = DefaultHasher::new();
+        config.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+
+        let slot = self
+            .contexts
+            .lock()
+            .await
+            .entry(id.clone())
+            .or_default()
+            .clone();
+
+        let mut current = slot.lock().await;
+        // Only if the connection configuration has not changed is this still compatible.
+        if let Some(context) = current.as_ref()
+            && context.fingerprint == fingerprint
+        {
+            return Ok(context.clone());
+        }
+
+        // TODO: This is a pretty important part, especially when connection
+        // configuration gets more complex, best moved somewhere more coherent.
+        let transport = ReqwestTransport::builder()
+            .destination(&config.url)
+            .sap_client(&config.client)
+            .language(&config.language)
+            .basic_auth(config.username.as_str(), &config.password)
+            .build()?;
+
+        let context = Arc::new(SystemContext {
+            client: Client::new(transport).discover().await?,
+            views: Mutex::new(HashMap::new()),
+            fingerprint,
+        });
+
+        *current = Some(context.clone());
+        Ok(context)
+    }
+}
+
+/// A view on a system - currently represented only by the [`VirtualRepositoryTree`].
+///
+/// Clients browsing the same project and destination share this context.
+pub struct SystemView {
+    pub mounts: Vec<MountConfig>,
+    pub tree: VirtualRepositoryTree,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ContextError {
     #[error(transparent)]
     Config(#[from] ConfigError),
-    #[error("invalid destination configuration: {0}")]
+
+    #[error(transparent)]
     Transport(#[from] zadt::ReqwestTransportBuildError),
-    #[error("ADT request failed: {0}")]
+
+    #[error(transparent)]
     Operation(#[from] zadt::OperationError),
-    #[error("repository tree failed: {0}")]
+
+    #[error(transparent)]
     Vfs(#[from] zvfs::VfsError),
-    #[error("timed out while building the repository context")]
+
+    #[error("Timed out while connecting to the repository or building its view")]
     BuildTimeout,
-    #[error("project configuration kept changing while building the repository context")]
-    ConfigurationChanged,
 }

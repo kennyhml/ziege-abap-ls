@@ -4,20 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "abap-language-server"
+name = "ziege-abap-ls"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 tower-lsp-server = "0.23.0"
 tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
+serde-inline-default = "1.0.2"
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde_yaml_ng = "0.10"
 thiserror = "2.0"
 toml = "0.9"
 url = "2.5"
+percent-encoding = "2.3"
 zadt = { path = "../ziege/crates/zadt", features = ["reqwest"] }
 zaff = { path = "../ziege/crates/zaff" }
 zvfs = { path = "../ziege/crates/zvfs" }
